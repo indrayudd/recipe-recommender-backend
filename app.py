@@ -56,50 +56,55 @@ def recipe_finder(title):
 @app.route('/recommend', methods=['GET'])
 def recommend():
     title = request.args.get('title', '')
+
+    # Ensure title is a string
+    if not isinstance(title, str) or not title.strip():
+        return jsonify({"error": "Invalid or missing title"}), 400
+
+    title = title.strip()  # Remove any surrounding whitespace
     n_recommendations = 20  # Fetch 20 recommendations initially
 
-    if not title:
-        return jsonify({"error": "No title provided"}), 400
+    try:
+        # Find the closest matching recipe
+        closest_recipe = recipe_finder(title)
+        if closest_recipe not in recipe_idx:
+            return jsonify({"error": f"Recipe '{title}' not found."}), 404
 
-    # Find the closest matching recipe
-    closest_recipe = recipe_finder(title)
+        idx = recipe_idx[closest_recipe]
+        # Get similarity scores and top recommendations
+        sim_scores = cosine_sim_top_k[idx].toarray().flatten()
+        sim_scores = list(enumerate(sim_scores))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:n_recommendations + 1]
 
-    if closest_recipe not in recipe_idx:
-        return jsonify({"error": f"Recipe '{title}' not found."}), 404
+        # Get indices of similar recipes
+        similar_recipes = [recipes.iloc[i[0]] for i in sim_scores]
 
-    idx = recipe_idx[closest_recipe]
+        # Randomly select 10 from the top 20 recommendations
+        random_recommendations = random.sample(similar_recipes, 10)
 
-    # Get similarity scores and top recommendations
-    sim_scores = cosine_sim_top_k[idx].toarray().flatten()
-    sim_scores = list(enumerate(sim_scores))
-    sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)[1:n_recommendations + 1]
+        def capitalize_recipe_name(name):
+            words = name.split()
+            capitalized_words = [word.capitalize() if not word.isdigit() else word for word in words]
+            return " ".join(capitalized_words)
 
-    # Get indices of similar recipes
-    similar_recipes = [recipes.iloc[i[0]] for i in sim_scores]
+        # Format recommendations:
+        recommendations = [
+            {
+                "recipe_name": capitalize_recipe_name(row['recipe_name']),
+                "tags": row['tags'] if not pd.isna(row['tags']) else "No tags available"
+            }
+            for row in random_recommendations
+        ]
 
-    # Randomly select 10 from the top 20 recommendations
-    random_recommendations = random.sample(similar_recipes, 10)
+        closest_recipe = capitalize_recipe_name(closest_recipe)
 
-    def capitalize_recipe_name(name):
-        words = name.split()
-        capitalized_words = [word.capitalize() if not word.isdigit() else word for word in words]
-        return " ".join(capitalized_words)
+        return jsonify({
+            "input_recipe": closest_recipe,
+            "recommendations": recommendations
+        })
 
-    # Update recommendations formatting:
-    recommendations = [
-        {
-            "recipe_name": capitalize_recipe_name(row['recipe_name']),
-            "tags": row['tags'] if not pd.isna(row['tags']) else "No tags available"
-        }
-        for row in random_recommendations
-    ]
-
-    closest_recipe = capitalize_recipe_name(closest_recipe)
-
-    return jsonify({
-        "input_recipe": closest_recipe,
-        "recommendations": recommendations
-    })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
