@@ -1,2 +1,5 @@
 hello-frontend/
 RAW_interactions.csv
+node_modules/
+RAW_recipes.csv
+data/

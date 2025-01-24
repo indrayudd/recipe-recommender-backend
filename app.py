@@ -1,16 +1,42 @@
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
 from scipy.sparse import load_npz
 from rapidfuzz import process
 import random
+from kaggle.api.kaggle_api_extended import KaggleApi
+
+from dotenv import load_dotenv
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
+# Kaggle dataset details
+DATASET_NAME = "shuyangli94/food-com-recipes-and-user-interactions"
+FILE_NAME = "RAW_recipes.csv"
+DATA_PATH = "data"  # Folder for datasets
+
+# Ensure the Kaggle dataset is downloaded
+def ensure_dataset():
+    if not os.path.exists(DATA_PATH):
+        os.makedirs(DATA_PATH)
+    dataset_file = os.path.join(DATA_PATH, FILE_NAME)
+    if not os.path.exists(dataset_file):
+        print("Downloading dataset from Kaggle...")
+        api = KaggleApi()
+        api.authenticate()
+        api.dataset_download_file(DATASET_NAME, FILE_NAME, path=DATA_PATH)
+        import zipfile
+        with zipfile.ZipFile(os.path.join(DATA_PATH, FILE_NAME + ".zip"), 'r') as zip_ref:
+            zip_ref.extractall(DATA_PATH)
+        os.remove(os.path.join(DATA_PATH, FILE_NAME + ".zip"))
+    return dataset_file
+
 # Load datasets
-raw_interactions = pd.read_csv('RAW_interactions.csv')  # Update paths as needed
-raw_recipes = pd.read_csv('RAW_recipes.csv')
+dataset_file = ensure_dataset()
+raw_recipes = pd.read_csv(dataset_file)
 
 # Preprocess datasets
 recipes = raw_recipes[['name', 'id', 'tags']]
@@ -69,7 +95,6 @@ def recommend():
     ]
 
     closest_recipe = capitalize_recipe_name(closest_recipe)
-
 
     return jsonify({
         "input_recipe": closest_recipe,
