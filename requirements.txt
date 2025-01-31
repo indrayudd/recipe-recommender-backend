@@ -6,3 +6,4 @@ rapidfuzz==3.11.0
 kaggle==1.5.13
 python-dotenv
 gunicorn
+openai
