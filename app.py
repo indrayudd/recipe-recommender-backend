@@ -69,7 +69,7 @@ def filter_recommendations_with_gpt(input_recipe, recommendations):
     """
 
     response = client.chat.completions.create(
-        model="gpt-4",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a recipe recommendation expert."},
             {"role": "user", "content": prompt}
@@ -100,12 +100,15 @@ def metadata():
         return jsonify({"error": "Invalid or missing title"}), 400
 
     try:
-        # Find closest recipe
-        closest_recipe_name = recipe_finder(title)
-        if closest_recipe_name not in recipe_idx:
-            return jsonify({"error": f"Recipe '{title}' not found"}), 404
-
-        idx = recipe_idx[closest_recipe_name]
+        if title in recipe_idx:
+            idx = recipe_idx[title]
+            closest_recipe_name = title
+        else:
+            # Otherwise, fall back to fuzzy matching.
+            closest_recipe_name = recipe_finder(title)
+            if closest_recipe_name not in recipe_idx:
+                return jsonify({"error": f"Recipe '{title}' not found"}), 404
+            idx = recipe_idx[closest_recipe_name]
         row = recipes.iloc[idx]
 
         # minutes -> plain int
@@ -218,6 +221,59 @@ def cover_recs():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+
+# ---------------------------------------------------------------------
+# 3) REMIX ENDPOINT
+# ---------------------------------------------------------------------
+@app.route('/remix', methods=['POST'])
+def remix_recipe():
+    data = request.get_json()
+    original = data.get('original')
+    newIngredients = data.get('newIngredients')
+    if not original or not newIngredients:
+        return jsonify({"error": "Missing data"}), 400
+
+    # Build the prompt using the original recipe metadata and the new ingredients list.
+    prompt = f"""Here's the original recipe called '{original.get('recipe_name')}' with the following metadata:
+{json.dumps(original, indent=2)}
+
+The modified list of ingredients are: {json.dumps(newIngredients)}
+
+In the same metadata format, including a name, give me a similar recipe with exactly these ingredients. If essential ingredients are missing, add them back; but use this power very sparingly.
+
+If the ingredient that is the point of the recipe is missing (like chicken in chicken tikka or potato in aloo gobi), you can either add it back or suggest a different recipe if you have any wiggle room with the remaining ingredients.
+
+Just know that if push comes to shove, you can sparingly make changes to the ingredients, but NEVER add ingredients in your steps that don't exist in the ingredient list.
+
+Return only a JSON response in the following format without any additional text or implicit formatting like ```json```:
+{{
+  "ingredients": [...],
+  "macros": {{ ... }},
+  "minutes": ...,
+  "recipe_name": "...",
+  "steps": [...]
+}}
+
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a creative recipe generator."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800,
+            temperature=0.7
+        )
+        # Debug: log the GPT response
+        print("GPT Response:", response.choices[0].message.content)
+        # Parse the response (expects GPT to return only the JSON metadata)
+        new_recipe = json.loads(response.choices[0].message.content)
+        return jsonify(new_recipe)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 def generate_dalle_image(recipe_name):
@@ -236,7 +292,7 @@ def generate_dalle_image(recipe_name):
         )
         return response.data[0].url
     except Exception as ex:
-        print("DALL·E 3 error:", ex)
+        print("DALL·E error:", ex)
         # fallback placeholder
         return "https://via.placeholder.com/1024?text=No+DALL-E+Access"
 
