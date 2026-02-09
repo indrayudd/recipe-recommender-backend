@@ -1,4 +1,5 @@
 import argparse
+import ast
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -30,6 +31,12 @@ class EvalSummary:
     missing_recommendations: int
     timestamp_utc: str
     sample_examples: list
+    distribution_summary: dict
+
+
+NUMERIC_RELATIVE_THRESHOLD = 0.2
+TAG_FREQUENCY_THRESHOLD = 0.05
+TAG_TOP_N = 10
 
 
 def load_recipes(dataset_path: str) -> pd.DataFrame:
@@ -79,6 +86,118 @@ def compute_top_k(sim_row: np.ndarray, top_k: int, skip_index: int) -> list:
     return filtered[:top_k]
 
 
+def parse_tags(tags_value) -> list:
+    if isinstance(tags_value, list):
+        return tags_value
+    if isinstance(tags_value, str):
+        try:
+            parsed = ast.literal_eval(tags_value)
+            if isinstance(parsed, list):
+                return parsed
+        except (ValueError, SyntaxError):
+            pass
+    return []
+
+
+def compute_numeric_stats(series: pd.Series) -> dict:
+    cleaned = pd.to_numeric(series, errors="coerce").dropna()
+    if cleaned.empty:
+        return {"mean": None, "median": None, "p10": None, "p90": None}
+    return {
+        "mean": float(cleaned.mean()),
+        "median": float(cleaned.median()),
+        "p10": float(cleaned.quantile(0.1)),
+        "p90": float(cleaned.quantile(0.9)),
+    }
+
+
+def compare_numeric_stats(sample_stats: dict, baseline_stats: dict) -> dict:
+    deltas = {}
+    warnings = []
+    for key in ("mean", "median", "p10", "p90"):
+        sample_value = sample_stats.get(key)
+        baseline_value = baseline_stats.get(key)
+        if sample_value is None or baseline_value in (None, 0):
+            deltas[key] = {"sample": sample_value, "baseline": baseline_value, "delta": None, "relative_delta": None}
+            continue
+        delta = sample_value - baseline_value
+        relative_delta = delta / baseline_value
+        deltas[key] = {
+            "sample": sample_value,
+            "baseline": baseline_value,
+            "delta": delta,
+            "relative_delta": relative_delta,
+        }
+        if abs(relative_delta) >= NUMERIC_RELATIVE_THRESHOLD:
+            warnings.append(
+                f"{key} relative delta {relative_delta:.2%} exceeds {NUMERIC_RELATIVE_THRESHOLD:.0%} threshold"
+            )
+    return {"deltas": deltas, "warnings": warnings}
+
+
+def compute_tag_frequencies(recipes_subset: pd.DataFrame) -> dict:
+    tag_counts = {}
+    total_tags = 0
+    for tags_value in recipes_subset["tags"].tolist():
+        tags = parse_tags(tags_value)
+        for tag in tags:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            total_tags += 1
+    if total_tags == 0:
+        return {"total_tags": 0, "frequencies": {}}
+    frequencies = {tag: count / total_tags for tag, count in tag_counts.items()}
+    return {"total_tags": total_tags, "frequencies": frequencies}
+
+
+def compare_tag_frequencies(sample_freq: dict, baseline_freq: dict) -> dict:
+    sample_frequencies = sample_freq.get("frequencies", {})
+    baseline_frequencies = baseline_freq.get("frequencies", {})
+    top_tags = sorted(sample_frequencies.items(), key=lambda item: item[1], reverse=True)[:TAG_TOP_N]
+    deltas = {}
+    warnings = []
+    for tag, sample_value in top_tags:
+        baseline_value = baseline_frequencies.get(tag, 0.0)
+        delta = sample_value - baseline_value
+        deltas[tag] = {
+            "sample": sample_value,
+            "baseline": baseline_value,
+            "delta": delta,
+        }
+        if abs(delta) >= TAG_FREQUENCY_THRESHOLD:
+            warnings.append(
+                f"tag '{tag}' frequency delta {delta:.2%} exceeds {TAG_FREQUENCY_THRESHOLD:.0%} threshold"
+            )
+    return {"top_tags": [tag for tag, _ in top_tags], "deltas": deltas, "warnings": warnings}
+
+
+def build_distribution_summary(recipes: pd.DataFrame, recommendation_indices: list) -> dict:
+    if not recommendation_indices:
+        return {
+            "minutes": {"deltas": {}, "warnings": ["no recommendations available to analyze"]},
+            "n_ingredients": {"deltas": {}, "warnings": ["no recommendations available to analyze"]},
+            "tags": {"top_tags": [], "deltas": {}, "warnings": ["no recommendations available to analyze"]},
+        }
+
+    baseline_minutes = compute_numeric_stats(recipes["minutes"])
+    baseline_ingredients = compute_numeric_stats(recipes["n_ingredients"])
+    recommended_recipes = recipes.iloc[recommendation_indices]
+    sample_minutes = compute_numeric_stats(recommended_recipes["minutes"])
+    sample_ingredients = compute_numeric_stats(recommended_recipes["n_ingredients"])
+
+    minutes_comparison = compare_numeric_stats(sample_minutes, baseline_minutes)
+    ingredients_comparison = compare_numeric_stats(sample_ingredients, baseline_ingredients)
+
+    baseline_tags = compute_tag_frequencies(recipes)
+    sample_tags = compute_tag_frequencies(recommended_recipes)
+    tag_comparison = compare_tag_frequencies(sample_tags, baseline_tags)
+
+    return {
+        "minutes": minutes_comparison,
+        "n_ingredients": ingredients_comparison,
+        "tags": tag_comparison,
+    }
+
+
 def evaluate_rankings(
     recipes: pd.DataFrame,
     similarity_matrix,
@@ -119,6 +238,8 @@ def evaluate_rankings(
     if sample_size - missing_recommendations > 0:
         average_recommendations = len(all_recommendations) / (sample_size - missing_recommendations)
 
+    distribution_summary = build_distribution_summary(recipes, all_recommendations)
+
     return EvalSummary(
         dataset_path=dataset_path,
         matrix_path=matrix_path,
@@ -131,6 +252,7 @@ def evaluate_rankings(
         missing_recommendations=missing_recommendations,
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         sample_examples=sample_examples,
+        distribution_summary=distribution_summary,
     )
 
 
