@@ -68,12 +68,16 @@ POST /remix
 ```
 - Accepts JSON with `original` (recipe metadata) and `newIngredients`, then returns a GPT-generated remix.
 
-## Offline Evaluation
+## Offline Evaluation (Ranking Sanity Checks)
 
-Run the local evaluation script to sanity-check recommendation rankings using the dataset and similarity matrix:
+Run the offline evaluation script to validate ranking quality with distribution checks, bias checks, and failure-case debugging artifacts.
 
 ```bash
-python eval/offline_eval.py --report-path
+python eval/offline_eval.py --sample-size 200 --top-k 20
 ```
 
-If the dataset is missing, the script will download it from Kaggle using the same credentials described above. JSON reports are written to `eval/results/` (default: `eval/results/latest.json`).
+Outputs:
+- Summary report at `eval/results/latest.json`
+- Failure-case details at `eval/results/failures/failures.json`
+
+If the dataset is missing, add `--allow-download` (requires Kaggle credentials).
