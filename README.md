@@ -67,3 +67,13 @@ GET /cover_recs?title=<recipe>
 POST /remix
 ```
 - Accepts JSON with `original` (recipe metadata) and `newIngredients`, then returns a GPT-generated remix.
+
+## Offline Evaluation
+
+Run the local evaluation script to sanity-check recommendation rankings using the dataset and similarity matrix:
+
+```bash
+python eval/offline_eval.py --report-path
+```
+
+If the dataset is missing, the script will download it from Kaggle using the same credentials described above. JSON reports are written to `eval/results/` (default: `eval/results/latest.json`).
