@@ -35,8 +35,7 @@ class EvalSummary:
 
 
 NUMERIC_RELATIVE_THRESHOLD = 0.2
-TAG_FREQUENCY_THRESHOLD = 0.05
-TAG_TOP_N = 10
+TAG_PREVALENCE_RATIO_THRESHOLD = 2.0
 
 
 def load_recipes(dataset_path: str) -> pd.DataFrame:
@@ -135,47 +134,80 @@ def compare_numeric_stats(sample_stats: dict, baseline_stats: dict) -> dict:
     return {"deltas": deltas, "warnings": warnings}
 
 
-def compute_tag_frequencies(recipes_subset: pd.DataFrame) -> dict:
+def compute_tag_prevalence(recipes_subset: pd.DataFrame) -> dict:
     tag_counts = {}
-    total_tags = 0
+    total_recipes = len(recipes_subset)
     for tags_value in recipes_subset["tags"].tolist():
-        tags = parse_tags(tags_value)
+        tags = set(parse_tags(tags_value))
         for tag in tags:
             tag_counts[tag] = tag_counts.get(tag, 0) + 1
-            total_tags += 1
-    if total_tags == 0:
-        return {"total_tags": 0, "frequencies": {}}
-    frequencies = {tag: count / total_tags for tag, count in tag_counts.items()}
-    return {"total_tags": total_tags, "frequencies": frequencies}
+    if total_recipes == 0:
+        return {"total_recipes": 0, "prevalence": {}}
+    prevalence = {tag: count / total_recipes for tag, count in tag_counts.items()}
+    return {"total_recipes": total_recipes, "prevalence": prevalence}
 
 
-def compare_tag_frequencies(sample_freq: dict, baseline_freq: dict) -> dict:
-    sample_frequencies = sample_freq.get("frequencies", {})
-    baseline_frequencies = baseline_freq.get("frequencies", {})
-    top_tags = sorted(sample_frequencies.items(), key=lambda item: item[1], reverse=True)[:TAG_TOP_N]
-    deltas = {}
+def compare_tag_prevalence(sample_prev: dict, baseline_prev: dict, ratio_threshold: float) -> dict:
+    sample_prevalence = sample_prev.get("prevalence", {})
+    baseline_prevalence = baseline_prev.get("prevalence", {})
+    tags = set(sample_prevalence) | set(baseline_prevalence)
+    lower_ratio = 1 / ratio_threshold if ratio_threshold else 0
+    deviations = {}
     warnings = []
-    for tag, sample_value in top_tags:
-        baseline_value = baseline_frequencies.get(tag, 0.0)
+    flagged_tags = []
+    for tag in sorted(tags):
+        sample_value = sample_prevalence.get(tag, 0.0)
+        baseline_value = baseline_prevalence.get(tag, 0.0)
+        ratio = None
+        if baseline_value > 0:
+            ratio = sample_value / baseline_value
         delta = sample_value - baseline_value
-        deltas[tag] = {
-            "sample": sample_value,
-            "baseline": baseline_value,
-            "delta": delta,
-        }
-        if abs(delta) >= TAG_FREQUENCY_THRESHOLD:
-            warnings.append(
-                f"tag '{tag}' frequency delta {delta:.2%} exceeds {TAG_FREQUENCY_THRESHOLD:.0%} threshold"
-            )
-    return {"top_tags": [tag for tag, _ in top_tags], "deltas": deltas, "warnings": warnings}
+        should_flag = False
+        if baseline_value == 0:
+            should_flag = sample_value > 0
+        elif ratio_threshold and (ratio >= ratio_threshold or ratio <= lower_ratio):
+            should_flag = True
+        if should_flag:
+            deviations[tag] = {
+                "sample": sample_value,
+                "baseline": baseline_value,
+                "delta": delta,
+                "ratio": ratio,
+            }
+            flagged_tags.append(tag)
+            if baseline_value == 0:
+                warnings.append(f"tag '{tag}' appears in recommendations but not in corpus")
+            else:
+                warnings.append(
+                    f"tag '{tag}' prevalence ratio {ratio:.2f} outside {lower_ratio:.2f}-{ratio_threshold:.2f}"
+                )
+    return {
+        "threshold_ratio": ratio_threshold,
+        "lower_ratio": lower_ratio,
+        "baseline_prevalence": baseline_prevalence,
+        "sample_prevalence": sample_prevalence,
+        "flagged_tags": flagged_tags,
+        "deviations": deviations,
+        "warnings": warnings,
+    }
 
 
-def build_distribution_summary(recipes: pd.DataFrame, recommendation_indices: list) -> dict:
+def build_distribution_summary(
+    recipes: pd.DataFrame, recommendation_indices: list, tag_ratio_threshold: float
+) -> dict:
     if not recommendation_indices:
         return {
             "minutes": {"deltas": {}, "warnings": ["no recommendations available to analyze"]},
             "n_ingredients": {"deltas": {}, "warnings": ["no recommendations available to analyze"]},
-            "tags": {"top_tags": [], "deltas": {}, "warnings": ["no recommendations available to analyze"]},
+            "tags": {
+                "threshold_ratio": tag_ratio_threshold,
+                "lower_ratio": 1 / tag_ratio_threshold if tag_ratio_threshold else 0,
+                "baseline_prevalence": {},
+                "sample_prevalence": {},
+                "flagged_tags": [],
+                "deviations": {},
+                "warnings": ["no recommendations available to analyze"],
+            },
         }
 
     baseline_minutes = compute_numeric_stats(recipes["minutes"])
@@ -187,9 +219,9 @@ def build_distribution_summary(recipes: pd.DataFrame, recommendation_indices: li
     minutes_comparison = compare_numeric_stats(sample_minutes, baseline_minutes)
     ingredients_comparison = compare_numeric_stats(sample_ingredients, baseline_ingredients)
 
-    baseline_tags = compute_tag_frequencies(recipes)
-    sample_tags = compute_tag_frequencies(recommended_recipes)
-    tag_comparison = compare_tag_frequencies(sample_tags, baseline_tags)
+    baseline_tags = compute_tag_prevalence(recipes)
+    sample_tags = compute_tag_prevalence(recommended_recipes)
+    tag_comparison = compare_tag_prevalence(sample_tags, baseline_tags, tag_ratio_threshold)
 
     return {
         "minutes": minutes_comparison,
@@ -204,6 +236,7 @@ def evaluate_rankings(
     sample_size: int,
     top_k: int,
     seed: int,
+    tag_ratio_threshold: float,
     dataset_path: str,
     matrix_path: str,
 ) -> EvalSummary:
@@ -238,7 +271,7 @@ def evaluate_rankings(
     if sample_size - missing_recommendations > 0:
         average_recommendations = len(all_recommendations) / (sample_size - missing_recommendations)
 
-    distribution_summary = build_distribution_summary(recipes, all_recommendations)
+    distribution_summary = build_distribution_summary(recipes, all_recommendations, tag_ratio_threshold)
 
     return EvalSummary(
         dataset_path=dataset_path,
@@ -269,6 +302,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-size", type=int, default=50, help="Number of recipes to sample")
     parser.add_argument("--top-k", type=int, default=10, help="Number of recommendations to inspect")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
+    parser.add_argument(
+        "--tag-prevalence-threshold",
+        type=float,
+        default=TAG_PREVALENCE_RATIO_THRESHOLD,
+        help="Flag tag prevalence ratios outside [1/x, x] in recommendations vs. corpus",
+    )
     parser.add_argument(
         "--report-path",
         nargs="?",
@@ -301,6 +340,7 @@ def main() -> None:
         args.sample_size,
         args.top_k,
         args.seed,
+        args.tag_prevalence_threshold,
         dataset_path,
         args.matrix_path,
     )
@@ -311,6 +351,12 @@ def main() -> None:
             print(f"{key}: {len(value)} examples")
         else:
             print(f"{key}: {value}")
+
+    tag_warnings = summary.distribution_summary.get("tags", {}).get("warnings", [])
+    if tag_warnings:
+        print("Tag prevalence warnings:")
+        for warning in tag_warnings:
+            print(f"- {warning}")
 
     if args.report_path is not None:
         write_report(args.report_path, summary)
