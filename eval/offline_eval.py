@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+from rapidfuzz import process
 from scipy.sparse import load_npz
 
 
@@ -32,10 +33,26 @@ class EvalSummary:
     timestamp_utc: str
     sample_examples: list
     distribution_summary: dict
+    failure_case_count: int
+    failure_artifacts: list
+
+
+@dataclass
+class FailureCase:
+    query_title: str
+    matched_title: str
+    failure_reasons: list
+    similarity_gap: float
+    tag_diversity_ratio: float
+    distribution_warnings: dict
+    recommendations: list
+    artifact_path: str
 
 
 NUMERIC_RELATIVE_THRESHOLD = 0.2
 TAG_PREVALENCE_RATIO_THRESHOLD = 2.0
+SIMILARITY_GAP_THRESHOLD = 0.05
+TAG_DIVERSITY_RATIO_THRESHOLD = 0.2
 
 
 def load_recipes(dataset_path: str) -> pd.DataFrame:
@@ -83,6 +100,12 @@ def compute_top_k(sim_row: np.ndarray, top_k: int, skip_index: int) -> list:
     sorted_indices = np.argsort(sim_row)[::-1]
     filtered = [idx for idx in sorted_indices if idx != skip_index]
     return filtered[:top_k]
+
+
+def recipe_finder(title: str, recipes: pd.DataFrame) -> str:
+    all_titles = recipes["recipe_name"].tolist()
+    closest_match = process.extractOne(title, all_titles)
+    return closest_match[0] if closest_match else title
 
 
 def parse_tags(tags_value) -> list:
@@ -192,6 +215,67 @@ def compare_tag_prevalence(sample_prev: dict, baseline_prev: dict, ratio_thresho
     }
 
 
+def compute_similarity_gap(sim_scores: list) -> float:
+    if len(sim_scores) < 2:
+        return 0.0
+    return sim_scores[0] - sim_scores[-1]
+
+
+def compute_tag_diversity_ratio(recommended_recipes: pd.DataFrame) -> float:
+    total_tags = 0
+    unique_tags = set()
+    for tags_value in recommended_recipes["tags"].tolist():
+        tags = parse_tags(tags_value)
+        total_tags += len(tags)
+        unique_tags.update(tags)
+    if total_tags == 0:
+        return 0.0
+    return len(unique_tags) / total_tags
+
+
+def collect_recommendation_metadata(recommended_recipes: pd.DataFrame, sim_scores: list) -> list:
+    metadata = []
+    for row, score in zip(recommended_recipes.itertuples(index=False), sim_scores):
+        metadata.append(
+            {
+                "title": row.recipe_name,
+                "similarity_score": float(score),
+                "minutes": int(row.minutes) if pd.notna(row.minutes) else None,
+                "n_ingredients": int(row.n_ingredients) if pd.notna(row.n_ingredients) else None,
+                "tags": parse_tags(row.tags),
+            }
+        )
+    return metadata
+
+
+def evaluate_distribution_warnings(
+    recipes: pd.DataFrame, recommended_recipes: pd.DataFrame, tag_ratio_threshold: float
+) -> dict:
+    baseline_minutes = compute_numeric_stats(recipes["minutes"])
+    baseline_ingredients = compute_numeric_stats(recipes["n_ingredients"])
+    sample_minutes = compute_numeric_stats(recommended_recipes["minutes"])
+    sample_ingredients = compute_numeric_stats(recommended_recipes["n_ingredients"])
+
+    minutes_comparison = compare_numeric_stats(sample_minutes, baseline_minutes)
+    ingredients_comparison = compare_numeric_stats(sample_ingredients, baseline_ingredients)
+
+    baseline_tags = compute_tag_prevalence(recipes)
+    sample_tags = compute_tag_prevalence(recommended_recipes)
+    tag_comparison = compare_tag_prevalence(sample_tags, baseline_tags, tag_ratio_threshold)
+
+    return {
+        "minutes": minutes_comparison.get("warnings", []),
+        "n_ingredients": ingredients_comparison.get("warnings", []),
+        "tags": tag_comparison.get("warnings", []),
+    }
+
+
+def write_failure_artifact(failure_dir: str, failure_case: FailureCase) -> None:
+    os.makedirs(failure_dir, exist_ok=True)
+    with open(failure_case.artifact_path, "w", encoding="utf-8") as failure_file:
+        json.dump(asdict(failure_case), failure_file, indent=2)
+
+
 def build_distribution_summary(
     recipes: pd.DataFrame, recommendation_indices: list, tag_ratio_threshold: float
 ) -> dict:
@@ -248,17 +332,25 @@ def evaluate_rankings(
     all_recommendations = []
     sample_examples = []
     missing_recommendations = 0
+    failure_cases = []
+    failure_dir = os.path.join("eval", "results", "failures")
+    recipe_idx = dict(zip(recipes["recipe_name"], list(recipes.index)))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     for idx in sampled_indices:
-        sim_row = similarity_matrix[idx].toarray().flatten()
-        top_indices = compute_top_k(sim_row, top_k, idx)
+        query_title = recipes.iloc[idx]["recipe_name"]
+        matched_title = recipe_finder(query_title, recipes)
+        matched_index = recipe_idx.get(matched_title, idx)
+
+        sim_row = similarity_matrix[matched_index].toarray().flatten()
+        top_indices = compute_top_k(sim_row, top_k, matched_index)
         if not top_indices:
             missing_recommendations += 1
             continue
         all_recommendations.extend(top_indices)
 
         if len(sample_examples) < 5:
-            input_name = recipes.iloc[idx]["recipe_name"]
+            input_name = matched_title
             rec_names = recipes.iloc[top_indices]["recipe_name"].tolist()
             sample_examples.append(
                 {
@@ -266,6 +358,38 @@ def evaluate_rankings(
                     "recommendations": rec_names,
                 }
             )
+
+        top_scores = sim_row[top_indices].tolist()
+        similarity_gap = compute_similarity_gap(top_scores)
+        recommended_recipes = recipes.iloc[top_indices]
+        tag_diversity_ratio = compute_tag_diversity_ratio(recommended_recipes)
+        distribution_warnings = evaluate_distribution_warnings(recipes, recommended_recipes, tag_ratio_threshold)
+
+        failure_reasons = []
+        if similarity_gap < SIMILARITY_GAP_THRESHOLD:
+            failure_reasons.append("low_similarity_gap")
+        if tag_diversity_ratio < TAG_DIVERSITY_RATIO_THRESHOLD:
+            failure_reasons.append("low_tag_diversity")
+        if any(distribution_warnings.values()):
+            failure_reasons.append("distribution_deviation")
+
+        if failure_reasons:
+            artifact_path = os.path.join(
+                failure_dir, f"failure_{matched_index}_{timestamp}.json"
+            )
+            recommendations = collect_recommendation_metadata(recommended_recipes, top_scores)
+            failure_case = FailureCase(
+                query_title=query_title,
+                matched_title=matched_title,
+                failure_reasons=failure_reasons,
+                similarity_gap=float(similarity_gap),
+                tag_diversity_ratio=float(tag_diversity_ratio),
+                distribution_warnings=distribution_warnings,
+                recommendations=recommendations,
+                artifact_path=artifact_path,
+            )
+            write_failure_artifact(failure_dir, failure_case)
+            failure_cases.append(failure_case)
 
     average_recommendations = 0.0
     if sample_size - missing_recommendations > 0:
@@ -286,6 +410,8 @@ def evaluate_rankings(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         sample_examples=sample_examples,
         distribution_summary=distribution_summary,
+        failure_case_count=len(failure_cases),
+        failure_artifacts=[case.artifact_path for case in failure_cases],
     )
 
 
